@@ -3,9 +3,8 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-
 name = "pyrust-jit"
-version = "0.1.0"
+version = "0.1.1"
 authors = [
   { name="Mateusz", email="mateuszsliwinski9@gmail.com" },
 ]
@@ -16,3 +15,7 @@ requires-python = ">=3.14"
 dependencies = [
     "loguru>=0.7.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mateusz-sliwinski/pyrust-jit"
+Repository = "https://github.com/mateusz-sliwinski/pyrust-jit"
