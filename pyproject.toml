@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+
+name = "pyrust-jit"
+version = "0.1.0"
+authors = [
+  { name="Mateusz", email="mateuszsliwinski9@gmail.com" },
+]
+description = "Library to dynamically compile Rust code on import"
+readme = "README.md"
+requires-python = ">=3.14"
+
+dependencies = [
+    "loguru>=0.7.0",
+]
