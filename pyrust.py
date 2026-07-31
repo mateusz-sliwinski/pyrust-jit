@@ -1,7 +1,6 @@
 import sys
 import os
 import re
-import fcntl
 import subprocess
 import shutil
 import hashlib
@@ -10,6 +9,24 @@ import time
 import importlib.util
 from importlib.abc import MetaPathFinder
 from importlib.machinery import ExtensionFileLoader
+
+if os.name == 'nt':
+    import msvcrt
+    def _lock_file(f):
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+    def _unlock_file(f):
+        f.seek(0)
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+    def _lock_file(f):
+        fcntl.flock(f, fcntl.LOCK_EX)
+    def _unlock_file(f):
+        fcntl.flock(f, fcntl.LOCK_UN)
 
 # We import logger directly from loguru instead of standard logging
 from loguru import logger
