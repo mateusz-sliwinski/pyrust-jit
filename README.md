@@ -1,4 +1,8 @@
-# Pyrust: Zero-Boilerplate Rust in Python
+# Why Pyrust-jit? (vs. Maturin / setuptools-rust)
+While tools like Maturin are the absolute gold standard for packaging and publishing production-ready Rust extensions to PyPI, they require setting up a Cargo workspace, managing pyproject.toml, and running build steps.
+
+Pyrust is built for rapid prototyping, Data Science, and local scripting.
+When you hit a performance bottleneck in Python (like a heavy loop or array computation), you shouldn't have to switch context to build a whole new project. With Pyrust, you just create a .rs file next to your script, write your fast logic, and import it. Zero config.
 
 Pyrust is a Python import hook that lets you import `.rs` files directly into your Python scripts. It eliminates the need for manual C-extension compilation, `setup.py` scripts, or external build configuration — your Rust code is compiled on the fly, the first time it's imported.
 
@@ -105,13 +109,24 @@ pyrust.enable(debug=True, release=False)
 
 - `release` (default `True`) — `False` compiles without optimizations (faster build, slower runtime).
 - `debug` (default `False`) — enables verbose Pyrust logging (via `loguru`) on `stderr`.
-
+- `release_profile` (default None) — Optional dictionary to override Cargo's [profile.release] settings (e.g., {"lto": True, "codegen_units": 1}).
 ## Caching
 
-Compiled libraries are kept in a `.pyrust_cache/` directory in the current working directory, named as `<module>_<source_hash>_<mode>.<extension>`. Any change to the source (the file itself, or any file in a crate directory) invalidates the cache and triggers a rebuild.
+Compiled libraries are kept in a .pyrust_cache/ directory in the current working directory, named as <module>_<source_hash>_<deps_hash>_<mode>.<extension>. Any change to the source (the file itself, or any file in a crate directory), the dependencies, or the Python version invalidates the cache and triggers a rebuild.
+
+You can easily manage this cache using the built-in CLI tool (see below).
+
+## Command-Line Interface (CLI)
+Pyrust provides a simple CLI to manage your cache and environment. Once installed, you can use the pyrust command in your terminal:
+
+`pyrust --purge`: Deletes the local .pyrust_cache directory. Use this when you want a guaranteed clean rebuild of all your extensions (e.g., after upgrading the Rust toolchain or modifying global settings).
+
+`pyrust --rustc-version`: Prints the currently active rustc toolchain version that Pyrust will use for compilation.
+
 
 ## Troubleshooting
 
 - **`'cargo' command not found`** — install Rust from https://rustup.rs/ and make sure `cargo` is on your `PATH`.
 - **Rust compilation error** — the full `stderr`/`stdout` from `cargo build` is logged; fixing it usually comes down to an error in the `.rs` code itself or a missing dependency (`pyrust-dep:`).
 - **Warning about `#[pymodule]` name mismatch** — Pyrust still loads the module correctly (it matches the real function name), but for clarity it's a good idea to name the `#[pymodule]` function the same as the import name.
+- **Corrupted Cache / Unexpected behavior** — Run pyrust --purge to force a clean environment and rebuild on the next import.
