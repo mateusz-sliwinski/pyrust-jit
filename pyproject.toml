@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyrust-jit"
-version = "0.1.2"
+version = "0.1.4"
 authors = [
   { name="Mateusz", email="mateuszsliwinski9@gmail.com" },
 ]
