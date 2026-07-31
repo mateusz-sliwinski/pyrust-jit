@@ -6,6 +6,7 @@ import shutil
 import hashlib
 import threading
 import time
+import argparse
 import importlib.util
 from importlib.abc import MetaPathFinder
 from importlib.machinery import ExtensionFileLoader
@@ -31,7 +32,7 @@ else:
 # We import logger directly from loguru instead of standard logging
 from loguru import logger
 
-CACHE_DIR = ".pyrust_cache"
+CACHE_DIR = os.environ.get("PYRUST_CACHE_DIR", ".pyrust_cache")
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
@@ -164,65 +165,123 @@ def find_pymodule_name(rs_path: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _split_top_level(s: str, sep: str = ',') -> list[str]:
+    """
+    Splits a string on `sep` only at nesting depth 0, treating <...>, (...)
+    and [...] as opaque groups. Used to pull apart generic type arguments
+    (Vec<Option<i32>>, HashMap<K, V>) and tuple members ((i32, String))
+    without getting confused by commas that belong to an inner type.
+    """
+    parts = []
+    current = []
+    depth = 0
+    for char in s:
+        if char in "<([":
+            depth += 1
+        elif char in ">)]":
+            depth -= 1
+        elif char == sep and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def resolve_type(rust_type: str) -> str:
+    """
+    Converts a Rust type string into its Python stub equivalent, recursively.
+
+    Handles, at any nesting depth: PyResult<T> and bare Result<T, E> (both
+    collapse to T — the stub describes the successful return value, not the
+    error path), Option<T>, Vec<T> (including Vec<Vec<T>>), HashMap<K, V>,
+    Bound<'py, T>, NumPy/Polars PyO3 wrapper types, tuples like (i32, String),
+    the unit type (), and falls back to returning unknown identifiers
+    (including local #[pyclass] struct/enum names) unchanged, since those
+    already match the generated Python class name as-is.
+    """
+    if not rust_type:
+        return "Any"
+
+    rust_type = rust_type.strip()
+
+    if rust_type in ("Vec<u8>", "&[u8]"):
+        return "bytes"
+
+    if rust_type in ("PyObject", "PyAny"):
+        return "Any"
+
+    # Clean up references & lifetimes (e.g., &'a mut String -> String)
+    rust_type = re.sub(r"&'?\w*\s*(mut\s+)?", "", rust_type).strip()
+
+    type_map = {
+        "i8": "int", "i16": "int", "i32": "int", "i64": "int", "i128": "int", "isize": "int",
+        "u8": "int", "u16": "int", "u32": "int", "u64": "int", "u128": "int", "usize": "int",
+        "f32": "float", "f64": "float",
+        "bool": "bool", "String": "str", "str": "str",
+    }
+
+    # Unit type / empty tuple
+    if rust_type == "()":
+        return "None"
+
+    # Tuple types: (T1, T2, ...)
+    if rust_type.startswith("(") and rust_type.endswith(")"):
+        inner = rust_type[1:-1].strip()
+        members = [resolve_type(part) for part in _split_top_level(inner, ',') if part.strip()]
+        if not members:
+            return "None"
+        return f"tuple[{', '.join(members)}]"
+
+    # Generic wrapper: Name<Args> (also matches paths like std::result::Result<T, E>)
+    generic_match = re.match(r'^([A-Za-z_][A-Za-z0-9_:]*)\s*<(.+)>$', rust_type, re.DOTALL)
+    if generic_match:
+        base = generic_match.group(1).split("::")[-1]
+        args = [a for a in _split_top_level(generic_match.group(2), ',') if a]
+
+        if base in ("PyResult", "Result"):
+            # Both collapse to the Ok/success type — the stub describes what
+            # you get back, not the error variant.
+            return resolve_type(args[0]) if args else "Any"
+        if base == "Option":
+            return f"Optional[{resolve_type(args[0])}]" if args else "Any"
+        if base == "Vec":
+            return f"list[{resolve_type(args[0])}]" if args else "list[Any]"
+        if base in ("HashMap", "BTreeMap"):
+            if len(args) == 2:
+                return f"dict[{resolve_type(args[0])}, {resolve_type(args[1])}]"
+            return "dict[Any, Any]"
+        if base == "Bound":
+            # Bound<'py, T> — the lifetime arg is irrelevant to the stub
+            return resolve_type(args[-1]) if args else "Any"
+        if re.match(r'^Py(?:Readonly)?Array\d*$', base):
+            return "np.ndarray"
+        if base == "PyDataFrame":
+            return "pl.DataFrame"
+        if base == "PySeries":
+            return "pl.Series"
+        # Unknown generic wrapper (custom #[pyclass] generic, etc.):
+        # best-effort passthrough with resolved args rather than dropping them.
+        return f"{base}[{', '.join(resolve_type(a) for a in args)}]"
+
+    # Plain base type, or an unrecognized identifier — which, for a local
+    # #[pyclass] struct/enum, is exactly the name we want: PyO3 exposes it
+    # to Python under that same name, so returning it unchanged is correct,
+    # not just accidentally working.
+    return type_map.get(rust_type, rust_type)
+
+
 def generate_type_stubs(main_rs_path: str, pyi_out_path: str):
     """
     Parses Rust source to generate a .pyi stub file.
     Supports #[pyfunction], #[pyclass], #[pymethods], and advanced types (Vec, Option, HashMap, NumPy, Polars).
     """
 
-    def resolve_type(rust_type: str) -> str:
-        if not rust_type:
-            return "Any"
-
-        type_map = {
-            "i8": "int", "i16": "int", "i32": "int", "i64": "int", "i128": "int", "isize": "int",
-            "u8": "int", "u16": "int", "u32": "int", "u64": "int", "u128": "int", "usize": "int",
-            "f32": "float", "f64": "float",
-            "bool": "bool", "String": "str", "&str": "str", "str": "str",
-        }
-
-        # Clean up references & lifetimes (e.g., &'a mut String -> String)
-        rust_type = re.sub(r"&'?\w*\s*(mut\s+)?", "", rust_type.strip())
-
-        # Unwrap PyResult<T> -> T
-        pyresult_match = re.match(r'PyResult<(.+)>', rust_type)
-        if pyresult_match:
-            rust_type = pyresult_match.group(1)
-
-        res = rust_type
-        # Handle Generics and library specific types via Regex substitution
-        res = re.sub(r'Bound<.+?,\s*(.+?)>', r'\1', res)
-        res = re.sub(r'Py(?:Readonly)?Array\d*<.+?>', 'np.ndarray', res)
-        res = re.sub(r'\bPyDataFrame\b', 'pl.DataFrame', res)
-        res = re.sub(r'\bPySeries\b', 'pl.Series', res)
-        res = re.sub(r'Vec<(.+?)>', r'list[\1]', res)
-        res = re.sub(r'Option<(.+?)>', r'Optional[\1]', res)
-        res = re.sub(r'HashMap<(.+?),\s*(.+?)>', r'dict[\1, \2]', res)
-
-        # Replace base types
-        for rs_t, py_t in type_map.items():
-            res = re.sub(rf'\b{re.escape(rs_t)}\b', py_t, res)
-
-        return res
-
     def split_args_smart(args_str: str) -> list[str]:
         """Splits arguments by comma, but ignores commas inside generics like <...>."""
-        args = []
-        current = []
-        depth = 0
-        for char in args_str:
-            if char == '<':
-                depth += 1
-            elif char == '>':
-                depth -= 1
-            elif char == ',' and depth == 0:
-                args.append("".join(current).strip())
-                current = []
-                continue
-            current.append(char)
-        if current:
-            args.append("".join(current).strip())
-        return args
+        return _split_top_level(args_str, ',')
 
     def parse_args(args_str: str, is_method: bool = False) -> str:
         py_args = ["self"] if is_method else []
@@ -419,10 +478,10 @@ def compile_rust_to_so(module_name: str, source_path: str, is_dir: bool) -> str:
 
     # Two processes (or threads) compiling the same module at the same time
     # would otherwise race on the same src/ and target/ dirs. A simple
-    # exclusive file lock serializes them.
+    # exclusive file lock serializes them, cross-platform via _lock_file.
     lock_path = build_dir + ".lock"
     with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        _lock_file(lock_file)
         try:
             cargo_toml = f"""[package]
 name = "{crate_name}"
@@ -461,7 +520,7 @@ crate-type = ["cdylib"]
             if returncode != 0:
                 logger.error("\n[Pyrust] Rust compilation error:")
                 logger.error(build_output)
-                raise SystemExit(1)
+                raise ImportError(f"Pyrust: Compilation failed for module '{crate_name}'. Check logs above.")
 
             # Generate type stubs (.pyi) right next to the original source code
             base_dir = os.path.dirname(source_path) if is_dir else os.path.dirname(source_path)
@@ -481,7 +540,7 @@ crate-type = ["cdylib"]
 
             raise FileNotFoundError("Pyrust Error: Compiled library not found in the target directory.")
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            _unlock_file(lock_file)
 
 
 class PyrustFinder(MetaPathFinder):
@@ -564,3 +623,63 @@ def enable(debug=False, release=True, release_profile: dict | None = None):
     # Prevent adding the finder multiple times if enable() is called twice
     if not any(isinstance(f, PyrustFinder) for f in sys.meta_path):
         sys.meta_path.insert(0, PyrustFinder())
+
+
+# --------------------------------------------------------------------------
+# Command-line interface: `pyrust --purge` / `python -m pyrust_jit --purge`
+# --------------------------------------------------------------------------
+
+def _cli_purge() -> None:
+    """
+    Deletes the local .pyrust_cache directory — both the compiled
+    .so/.pyd/.dylib artifacts and the persistent per-module Cargo build
+    dirs (including their target/ incremental-compilation state) added for
+    faster rebuilds. Use this when you want a guaranteed clean rebuild,
+    e.g. after a toolchain upgrade or if the cache is suspected corrupted.
+    """
+    if os.path.isdir(CACHE_DIR):
+        size = sum(
+            os.path.getsize(os.path.join(root, f))
+            for root, _, files in os.walk(CACHE_DIR)
+            for f in files
+        )
+        shutil.rmtree(CACHE_DIR)
+        print(f"[Pyrust] Purged '{CACHE_DIR}' ({size / (1024 * 1024):.1f} MB freed).")
+    else:
+        print(f"[Pyrust] Nothing to purge — '{CACHE_DIR}' does not exist.")
+
+
+def _cli_rustc_version() -> None:
+    """Prints the rustc toolchain version that `cargo build` will use."""
+    if shutil.which("rustc") is None:
+        print("[Pyrust] 'rustc' not found on PATH. Install it from https://rustup.rs/")
+        return
+    result = subprocess.run(["rustc", "--version"], capture_output=True, text=True)
+    output = (result.stdout or result.stderr).strip()
+    print(f"[Pyrust] {output}")
+
+
+def _cli_main(argv=None) -> None:
+    parser = argparse.ArgumentParser(prog="pyrust", description="pyrust-jit command-line utilities.")
+    parser.add_argument(
+        "--purge", action="store_true",
+        help="Delete the local .pyrust_cache directory (compiled binaries and persistent Cargo build dirs).",
+    )
+    parser.add_argument(
+        "--rustc-version", action="store_true",
+        help="Print the rustc toolchain version that will be used to compile.",
+    )
+    args = parser.parse_args(argv)
+
+    if not (args.purge or args.rustc_version):
+        parser.print_help()
+        return
+
+    if args.rustc_version:
+        _cli_rustc_version()
+    if args.purge:
+        _cli_purge()
+
+
+if __name__ == "__main__":
+    _cli_main()
